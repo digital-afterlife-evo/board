@@ -112,6 +112,7 @@ class DeviceService:
         self._listeners: list[Callable[[dict], None]] = []
         self._pending: list[tuple[bytes, bytes]] = []
         self._end_pending: bytes | None = None
+        self._input_request_id: str | None = None
         self._agent_broadcast: Callable[[dict], None] | None = None
 
     def add_listener(self, callback: Callable[[dict], None]) -> None:
@@ -151,8 +152,12 @@ class DeviceService:
                         setattr(self.snapshot, key, value[key])
                 if value.get("state") == "editing" and self.snapshot.active_request:
                     self.snapshot.active_request = None
-                    self.snapshot.candidate = ""
             elif frame.type == INPUT_DELTA:
+                if frame.request_id != bytes(16):
+                    request_id = str(uuid.UUID(bytes=frame.request_id))
+                    if request_id != self._input_request_id:
+                        self.snapshot.candidate = ""
+                        self._input_request_id = request_id
                 for char in frame.payload.decode("ascii"):
                     if char == "\b":
                         self.snapshot.candidate = self.snapshot.candidate[:-1]
