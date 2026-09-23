@@ -49,6 +49,9 @@ def run() -> int:
     queue = QLabel("队列：0 / 0；credit：0")
     recover_button = QPushButton("恢复设备")
 
+    candidate = QPlainTextEdit()
+    candidate.setReadOnly(True)
+    candidate.setPlaceholderText("按 Ctrl+Enter 提交后，这里显示本次提交内容")
     computer_input = QPlainTextEdit()
     computer_input.setPlaceholderText("在电脑输入内容；点击“实时追加”会立即送入打字机")
     agent_output = QPlainTextEdit()
@@ -72,7 +75,9 @@ def run() -> int:
 
     left = QWidget()
     left_layout = QVBoxLayout(left)
-    left_layout.addWidget(QLabel("电脑输入区（键盘内容在 ESP32 本地暂存，Ctrl+Enter 时一次性提交）"))
+    left_layout.addWidget(QLabel("已提交内容（Ctrl+Enter 后显示）"))
+    left_layout.addWidget(candidate, 2)
+    left_layout.addWidget(QLabel("电脑输入区（键盘内容在 ESP32 本地暂存）"))
     left_layout.addWidget(computer_input, 2)
     left_layout.addLayout(input_buttons)
 
@@ -151,6 +156,7 @@ def run() -> int:
         status.setText(f"状态：{snapshot['state']} | 串口：{snapshot.get('port') or '无'}")
         queue.setText(f"队列：{snapshot.get('queued_bytes', 0)} / "
                       f"{snapshot.get('capacity', 0)}；credit：{snapshot.get('credit', 0)}")
+        candidate.setPlainText(snapshot.get("candidate", ""))
         agent_output.setPlainText(snapshot.get("agent_output", ""))
         activity.setPlainText("\n".join(snapshot.get("events", [])))
         connect_button.setText("断开" if snapshot.get("connected") else "连接")
