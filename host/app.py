@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 from .api import AgentGateway
@@ -12,11 +13,20 @@ def run() -> int:
     parser.add_argument("--port", default="COM5", help="serial port")
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--api-port", type=int, default=8765)
+    parser.add_argument("--debug", action="store_true", help="print every UART frame and state transition")
     args = parser.parse_args()
 
-    service = DeviceService()
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
+    service = DeviceService(debug=args.debug)
     gateway = AgentGateway(service, port=args.api_port)
     gateway.start()
+    if args.debug:
+        try:
+            service.bridge.open(args.port, args.baud)
+            logging.info("debug serial connected: %s", args.port)
+        except Exception as exc:
+            logging.exception("debug serial connection failed: %s", exc)
 
     try:
         from PyQt6.QtCore import QTimer

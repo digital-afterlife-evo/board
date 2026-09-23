@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 import threading
 import time
 from typing import Callable
@@ -39,7 +40,7 @@ class DeviceSnapshot:
 
 
 class SerialBridge:
-    def __init__(self, on_frame: Callable[[Frame], None], on_change: Callable[[], None]):
+    def __init__(self, on_frame: Callable[[Frame], None], on_change: Callable[[], None], debug: bool = False):
         self.on_frame = on_frame
         self.on_change = on_change
         self.snapshot = DeviceSnapshot()
@@ -48,6 +49,7 @@ class SerialBridge:
         self._stop = threading.Event()
         self._write_lock = threading.Lock()
         self._sequence = 0
+        self.debug = debug
 
     @staticmethod
     def ports() -> list[dict]:
@@ -95,6 +97,10 @@ class SerialBridge:
                 if not data:
                     continue
                 for frame in decoder.feed(data):
+                    if self.debug:
+                        logging.debug("UART RX type=%d seq=%d request=%s len=%d payload=%r",
+                                      frame.type, frame.sequence, frame.request_id.hex(),
+                                      len(frame.payload), frame.payload)
                     self.on_frame(frame)
         except Exception as exc:  # serial disconnects are surfaced in state
             self.snapshot.last_error = str(exc)
@@ -105,9 +111,10 @@ class SerialBridge:
 
 
 class DeviceService:
-    def __init__(self):
+    def __init__(self, debug: bool = False):
         self.lock = threading.RLock()
-        self.bridge = SerialBridge(self._on_frame, self._changed)
+        self.bridge = SerialBridge(self._on_frame, self._changed, debug=debug)
+        self.debug = debug
         self.snapshot = self.bridge.snapshot
         self._listeners: list[Callable[[dict], None]] = []
         self._pending: list[tuple[bytes, bytes]] = []
@@ -140,6 +147,10 @@ class DeviceService:
 
     def _on_frame(self, frame: Frame) -> None:
         with self.lock:
+            if self.debug:
+                logging.debug("SERVICE frame type=%d candidate_len=%d active=%s state=%s",
+                              frame.type, len(self.snapshot.candidate),
+                              self.snapshot.active_request, self.snapshot.state)
             if frame.type == HELLO:
                 hello = json.loads(frame.payload.decode("ascii"))
                 self.snapshot.device = hello.get("device")
@@ -163,6 +174,9 @@ class DeviceService:
                         self.snapshot.candidate = self.snapshot.candidate[:-1]
                     else:
                         self.snapshot.candidate += char
+                if self.debug:
+                    logging.debug("CANDIDATE updated len=%d text=%r",
+                                  len(self.snapshot.candidate), self.snapshot.candidate)
             elif frame.type == INPUT_SUBMITTED:
                 request_id = str(uuid.UUID(bytes=frame.request_id))
                 if frame.payload:
@@ -171,6 +185,10 @@ class DeviceService:
                 self.snapshot.state = "thinking"
                 self.snapshot.agent_output = ""
                 self._record(f"提交请求: {request_id}")
+                if self.debug:
+                    logging.debug("SUBMITTED request=%s candidate_len=%d text=%r",
+                                  request_id, len(self.snapshot.candidate),
+                                  self.snapshot.candidate)
                 self._pending.clear()
                 self._end_pending = None
                 self._emit_agent({"v": 1, "type": "input.submitted",
