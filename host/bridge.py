@@ -29,9 +29,13 @@ class DeviceSnapshot:
     printed_bytes: int = 0
     active_request: str | None = None
     last_error: str | None = None
+    agent_output: str = ""
+    events: list[str] = None
 
     def as_dict(self) -> dict:
-        return self.__dict__.copy()
+        value = self.__dict__.copy()
+        value["events"] = list(self.events or [])
+        return value
 
 
 class SerialBridge:
@@ -103,8 +107,8 @@ class SerialBridge:
 class DeviceService:
     def __init__(self):
         self.lock = threading.RLock()
-        self.snapshot = DeviceSnapshot()
         self.bridge = SerialBridge(self._on_frame, self._changed)
+        self.snapshot = self.bridge.snapshot
         self._listeners: list[Callable[[dict], None]] = []
         self._pending: list[tuple[bytes, bytes]] = []
         self._end_pending: bytes | None = None
@@ -127,11 +131,18 @@ class DeviceService:
         if self._agent_broadcast:
             self._agent_broadcast(message)
 
+    def _record(self, message: str) -> None:
+        if self.snapshot.events is None:
+            self.snapshot.events = []
+        self.snapshot.events.append(message)
+        del self.snapshot.events[:-100]
+
     def _on_frame(self, frame: Frame) -> None:
         with self.lock:
             if frame.type == HELLO:
                 hello = json.loads(frame.payload.decode("ascii"))
                 self.snapshot.device = hello.get("device")
+                self._record(f"HELLO: {self.snapshot.device}")
                 self.bridge.send(HELLO_ACK)
             elif frame.type == STATE:
                 value = json.loads(frame.payload.decode("ascii"))
@@ -142,11 +153,19 @@ class DeviceService:
                     self.snapshot.active_request = None
                     self.snapshot.candidate = ""
             elif frame.type == INPUT_DELTA:
-                self.snapshot.candidate += frame.payload.decode("ascii")
+                for char in frame.payload.decode("ascii"):
+                    if char == "\b":
+                        self.snapshot.candidate = self.snapshot.candidate[:-1]
+                    else:
+                        self.snapshot.candidate += char
             elif frame.type == INPUT_SUBMITTED:
                 request_id = str(uuid.UUID(bytes=frame.request_id))
+                if frame.payload:
+                    self.snapshot.candidate = frame.payload.decode("ascii")
                 self.snapshot.active_request = request_id
                 self.snapshot.state = "thinking"
+                self.snapshot.agent_output = ""
+                self._record(f"提交请求: {request_id}")
                 self._pending.clear()
                 self._end_pending = None
                 self._emit_agent({"v": 1, "type": "input.submitted",
@@ -159,11 +178,13 @@ class DeviceService:
                 self.snapshot.queued_bytes = int(value.get("queued", 0))
                 self._flush_pending()
             elif frame.type == PRINT_PROGRESS:
+                self._record("设备打印进度更新")
                 self._emit_agent({"v": 1, "type": "print.progress",
                                   "request_id": str(uuid.UUID(bytes=frame.request_id))})
             elif frame.type == ERROR:
                 value = json.loads(frame.payload.decode("ascii"))
                 self.snapshot.last_error = value.get("error", "device_error")
+                self._record(f"设备错误: {self.snapshot.last_error}")
                 self._emit_agent({"v": 1, "type": "device.error", "error": self.snapshot.last_error})
         self._changed()
 
@@ -197,6 +218,8 @@ class DeviceService:
             if self.snapshot.active_request != request_id:
                 raise RuntimeError("unknown request")
             payload = text.encode("ascii")
+            self.snapshot.agent_output += text
+            self._record(f"Agent 输出 {len(payload)} 字节")
             for offset in range(0, len(payload), 128):
                 chunk = payload[offset:offset + 128]
                 if self.snapshot.credit >= len(chunk):
@@ -225,6 +248,8 @@ class DeviceService:
             request_id = str(uuid.uuid4())
             self.snapshot.active_request = request_id
             self.snapshot.state = "responding"
+            self.snapshot.agent_output = ""
+            self._record(f"电脑直接打印请求: {request_id}")
             self._pending.clear()
             self._end_pending = None
         self.response_delta(request_id, 0, text)
