@@ -108,7 +108,9 @@ class AgentGateway:
         try:
             if kind == "response.start":
                 return
-            if kind == "response.delta":
+            if kind == "stop.ack":
+                self.service.acknowledge_stop(message["stop_id"])
+            elif kind == "response.delta":
                 self.service.response_delta(message["request_id"], int(message.get("seq", 0)),
                                             message.get("text", ""))
             elif kind == "response.end":

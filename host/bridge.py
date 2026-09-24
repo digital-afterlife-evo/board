@@ -38,6 +38,7 @@ class DeviceSnapshot:
     last_device_seen_at: int | None = None
     last_delivery: dict | None = None
     last_tx_byte: str | None = None
+    last_stop_id: str | None = None
 
     def as_dict(self) -> dict:
         value = self.__dict__.copy()
@@ -46,7 +47,7 @@ class DeviceSnapshot:
 
 
 class SerialBridge:
-    def __init__(self, on_frame: Callable[[Frame], None], on_change: Callable[[], None], debug: bool = False):
+    def __init__(self, on_frame: Callable[[Frame], None], on_change: Callable[[], None], debug: bool = False, on_escape: Callable[[], None] | None = None):
         self.on_frame = on_frame
         self.on_change = on_change
         self.snapshot = DeviceSnapshot()
@@ -57,6 +58,7 @@ class SerialBridge:
         self._sequence = 0
         self.debug = debug
         self._log_tail = b""
+        self.on_escape = on_escape
 
     @staticmethod
     def ports() -> list[dict]:
@@ -99,6 +101,24 @@ class SerialBridge:
         with self._write_lock:
             self._serial.write(frame)
 
+    def _diagnostics(self, data: bytes) -> None:
+        self._log_tail = (self._log_tail + data)[-4096:]
+        started = list(re.finditer(rb"starting byte 0x([0-9A-Fa-f]{2})", self._log_tail))
+        if started:
+            self.snapshot.last_tx_byte = started[-1].group(1).decode("ascii")
+        # ponytail: shipped firmware logs unmapped ESC; replace with a protocol event if firmware logging changes.
+        events = list(re.finditer(rb"I \(\d+\) USB_KBD: unmapped HID key 0x29\r?\n|ACK timeout:[^\r\n]*[\r\n]", self._log_tail))
+        for event in events:
+            if event.group(0).startswith(b"I "):
+                if self.on_escape:
+                    self.on_escape()
+            else:
+                self.snapshot.last_error = event.group(0).decode("ascii", errors="replace").strip()
+                logging.error("[board.uart.ack_timeout] last_byte=%s detail=%s", self.snapshot.last_tx_byte, self.snapshot.last_error)
+                self.on_change()
+        if events:
+            self._log_tail = self._log_tail[events[-1].end():]
+
     def _reader(self) -> None:
         decoder = Decoder()
         try:
@@ -106,23 +126,13 @@ class SerialBridge:
                 data = self._serial.read(256)
                 if not data:
                     continue
-                # Firmware diagnostics share this UART with protocol frames. Retain only hardware errors.
-                self._log_tail = (self._log_tail + data)[-4096:]
-                started = list(re.finditer(rb"starting byte 0x([0-9A-Fa-f]{2})", self._log_tail))
-                if started:
-                    self.snapshot.last_tx_byte = started[-1].group(1).decode("ascii")
-                failure = re.search(rb"ACK timeout:[^\r\n]*[\r\n]", self._log_tail)
-                if failure:
-                    self.snapshot.last_error = failure.group(0).decode("ascii", errors="replace").strip()
-                    self._log_tail = self._log_tail[failure.end():]
-                    logging.error("[board.uart.ack_timeout] last_byte=%s detail=%s", self.snapshot.last_tx_byte, self.snapshot.last_error)
-                    self.on_change()
                 for frame in decoder.feed(data):
                     if self.debug:
                         logging.debug("[board.uart.rx] type=%d seq=%d request_id=%s bytes=%d",
                                       frame.type, frame.sequence, frame.request_id.hex(),
                                       len(frame.payload))
                     self.on_frame(frame)
+                self._diagnostics(data)
         except Exception as exc:  # serial disconnects are surfaced in state
             logging.error("[board.serial.failed] port=%s error=%s", self.snapshot.port, type(exc).__name__)
             self.snapshot.last_error = str(exc)
@@ -135,7 +145,7 @@ class SerialBridge:
 class DeviceService:
     def __init__(self, debug: bool = False, char_interval_ms: int = 0, return_delay_ms: int = 0):
         self.lock = threading.RLock()
-        self.bridge = SerialBridge(self._on_frame, self._changed, debug=debug)
+        self.bridge = SerialBridge(self._on_frame, self._changed, debug=debug, on_escape=self.stop)
         self.debug = debug
         self.snapshot = self.bridge.snapshot
         self._listeners: list[Callable[[dict], None]] = []
@@ -160,6 +170,7 @@ class DeviceService:
         self._last_state_log = None
         self._last_output_log = 0.0
         self._sent_bytes = 0
+        self._stop_pending = False
 
     def _begin_output(self, request_id: str, source: str) -> None:
         logging.info("[board.output.begin] request_id=%s source=%s printed_baseline=%d", request_id, source, self.snapshot.printed_bytes)
@@ -185,6 +196,8 @@ class DeviceService:
     def begin_thinking(self, request_id: str) -> str:
         request_id = str(uuid.UUID(request_id))
         with self.lock:
+            if self._stop_pending:
+                raise RuntimeError("busy")
             if self.snapshot.active_request == request_id:
                 return request_id
             if self.snapshot.active_request or self.snapshot.state != "editing":
@@ -379,6 +392,8 @@ class DeviceService:
     def response_delta(self, request_id: str, seq: int, text: str) -> None:
         rid = uuid.UUID(request_id).bytes
         with self.lock:
+            if request_id == self._cancel_pending:
+                return
             if self.snapshot.active_request != request_id:
                 raise RuntimeError("unknown request")
             payload = text.encode("ascii")
@@ -412,6 +427,8 @@ class DeviceService:
     def response_end(self, request_id: str) -> None:
         rid = uuid.UUID(request_id).bytes
         with self.lock:
+            if request_id == self._cancel_pending:
+                return
             if self.snapshot.active_request != request_id:
                 raise RuntimeError("unknown request")
             if self._end_sent == request_id or self._end_pending == rid:
@@ -428,6 +445,8 @@ class DeviceService:
             raise ValueError("unsupported or oversized print text")
         request_id = str(uuid.UUID(request_id)) if request_id else str(uuid.uuid4())
         with self.lock:
+            if self._stop_pending:
+                raise RuntimeError("busy")
             if self.snapshot.active_request == request_id:
                 if self.snapshot.agent_output != text:
                     raise ValueError("request text conflict")
@@ -465,6 +484,28 @@ class DeviceService:
             self._recover_pending = True
             self.bridge.send(RECOVER)
 
+    def stop(self) -> None:
+        with self.lock:
+            self.snapshot.last_stop_id = str(uuid.uuid4())
+            self._stop_pending = True
+            self._pending.clear()
+            self._end_pending = None
+            self._end_sent = None
+            self._reply_started = True
+            request_id = self.snapshot.active_request
+            logging.warning("[board.escape] stop_id=%s request_id=%s", self.snapshot.last_stop_id, request_id)
+            self._emit_agent({"v": 1, "type": "input.cancelled", "stop_id": self.snapshot.last_stop_id})
+            if request_id:
+                self.cancel(request_id)
+                if self.snapshot.active_request:
+                    self.snapshot.active_source = "cancelled"
+        self._changed()
+
+    def acknowledge_stop(self, stop_id: str) -> None:
+        with self.lock:
+            if stop_id == self.snapshot.last_stop_id:
+                self._stop_pending = False
+
     def cancel(self, request_id: str) -> None:
         with self.lock:
             if request_id != self.snapshot.active_request:
@@ -476,4 +517,9 @@ class DeviceService:
             self._draining_seen = False
             self._cancel_pending = request_id
             self._reply_started = True
-            self.bridge.send(CANCEL, b"", uuid.UUID(request_id).bytes)
+            if self.snapshot.active_source in {"direct", "web-thinking"} and not self._sent_bytes:
+                self.snapshot.active_request = None
+                self.snapshot.active_source = None
+                self.snapshot.state = "editing"
+            else:
+                self.bridge.send(CANCEL, b"", uuid.UUID(request_id).bytes)

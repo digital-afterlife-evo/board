@@ -7,11 +7,12 @@ import uuid
 
 from host.api import AgentGateway
 from host.bridge import DeviceService, DeviceSnapshot
-from host.protocol import Frame, INPUT_SUBMITTED, PRINT_DATA, PRINT_END, RECOVER, STATE
+from host.protocol import Frame, INPUT_SUBMITTED, PRINT_DATA, PRINT_END, RECOVER, STATE, CANCEL
 
 
 def main():
     service = DeviceService()
+    diagnostics = service.bridge._diagnostics
 
     class SimulatedBridge:
         def __init__(self):
@@ -19,7 +20,7 @@ def main():
             self.snapshot.test_output = ""
 
         def send(self, kind, payload=b"", request_id=None):
-            if kind == RECOVER:
+            if kind in (RECOVER, CANCEL):
                 service._on_frame(Frame(STATE, 0, bytes(16), 0, b'{"state":"editing","queued_bytes":0}'))
             if kind == PRINT_DATA:
                 self.snapshot.test_output += payload.decode("ascii")
@@ -43,7 +44,9 @@ def main():
         for line in sys.stdin:
             message = json.loads(line)
             rid = message.get("request_id", str(uuid.uuid4()))
-            if message.get("type") == "fault":
+            if message.get("type") == "escape":
+                diagnostics(b"I (1234) USB_KBD: unmapped HID key 0x29\r\n")
+            elif message.get("type") == "fault":
                 service.snapshot.state = "fault"
                 service.snapshot.last_error = "ACK timeout: simulated"
                 service._changed()

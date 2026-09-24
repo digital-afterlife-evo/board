@@ -3,7 +3,7 @@ import uuid
 import json
 from unittest.mock import patch
 
-from host.bridge import DeviceService, DeviceSnapshot
+from host.bridge import DeviceService, DeviceSnapshot, SerialBridge
 from host.protocol import PRINT_DATA, PRINT_END, INPUT_SUBMITTED, STATE, CANCEL, RECOVER, Frame
 
 
@@ -83,6 +83,32 @@ class BridgeTests(unittest.TestCase):
         service.snapshot.credit = 1000
         service._flush_pending()
         self.assertEqual([x[0] for x in service.bridge.sent], [CANCEL])
+
+    def test_escape_log_stops_pending_output_once_and_blocks_late_replies(self):
+        service = self.service()
+        rid = service.snapshot.active_request
+        messages = []
+        service.set_agent_broadcast(messages.append)
+        service.response_delta(rid, 0, "DO NOT PRINT")
+        reader = SerialBridge(lambda _: None, lambda: None, on_escape=service.stop)
+        reader._diagnostics(b"I (120) USB_KBD: unmapped HID key 0x")
+        self.assertEqual(messages, [])
+        reader._diagnostics(b"29\r\n")
+        reader._diagnostics(b"unrelated serial data")
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["type"], "input.cancelled")
+        service.response_delta(rid, 1, "LATE REPLY")
+        service.response_end(rid)
+        service.snapshot.credit = 1000
+        service.tick_output(1000)
+        self.assertEqual([x[0] for x in service.bridge.sent], [CANCEL])
+        service._on_frame(Frame(STATE, 0, bytes(16), 0, b'{"state":"editing","queued_bytes":0}'))
+        self.assertIsNone(service.snapshot.active_request)
+        with self.assertRaises(RuntimeError):
+            service.print_text("STILL BLOCKED")
+        service.acknowledge_stop(messages[0]["stop_id"])
+        service.print_text("NEW")
+        self.assertEqual(b"".join(x[1] for x in service.bridge.sent if x[0] == PRINT_DATA), b"NEW")
 
     def test_lost_draining_frame_can_use_ack_counter_but_idle_alone_is_insufficient(self):
         service = self.service()
