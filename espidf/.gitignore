@@ -1,0 +1,10 @@
+/build/
+/build-*/
+/build-direct/
+/\.component-cache/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/upstream/
+/tests/build/
+__pycache__/

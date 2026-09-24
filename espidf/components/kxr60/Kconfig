@@ -1,0 +1,9 @@
+menu "KX-R60 interface"
+    config KXR60_ACK_TIMEOUT_MS
+        int "Timeout per ACK transition (milliseconds)"
+        range 10 5000
+        default 500
+        help
+            Each ACK phase has its own deadline. A timeout releases the lines
+            and latches a fault until explicit recovery with kxr60_init().
+endmenu

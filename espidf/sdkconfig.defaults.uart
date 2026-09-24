@@ -1,0 +1,4 @@
+# Apply after sdkconfig.defaults in a fresh configuration for a UART bridge.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y

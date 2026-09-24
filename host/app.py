@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import threading
 
 from .api import AgentGateway
 from .bridge import DeviceService
@@ -14,19 +15,36 @@ def run() -> int:
     parser.add_argument("--baud", type=int, default=115200)
     parser.add_argument("--api-port", type=int, default=8765)
     parser.add_argument("--debug", action="store_true", help="print every UART frame and state transition")
+    parser.add_argument("--headless", action="store_true", help="run without Qt or stdin, and connect the serial port")
+    parser.add_argument("--char-interval-ms", type=int, default=80, help="minimum interval between output bytes")
+    parser.add_argument("--return-delay-ms", type=int, default=500, help="mechanical settling time after carriage return")
     args = parser.parse_args()
 
-    if args.debug:
-        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(message)s")
-    service = DeviceService(debug=args.debug)
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.info("[board.startup] port=%s baud=%d api_port=%d char_interval_ms=%d return_delay_ms=%d headless=%s",
+                 args.port, args.baud, args.api_port, args.char_interval_ms, args.return_delay_ms, args.headless)
+    if not 0 <= args.char_interval_ms <= 1000 or not 0 <= args.return_delay_ms <= 5000:
+        parser.error("invalid printer pacing")
+    service = DeviceService(debug=args.debug, char_interval_ms=args.char_interval_ms, return_delay_ms=args.return_delay_ms)
     gateway = AgentGateway(service, port=args.api_port)
     gateway.start()
-    if args.debug:
+    if args.debug or args.headless:
         try:
             service.bridge.open(args.port, args.baud)
             logging.info("debug serial connected: %s", args.port)
         except Exception as exc:
             logging.exception("debug serial connection failed: %s", exc)
+
+    if args.headless:
+        try:
+            threading.Event().wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            gateway.stop()
+            service.bridge.close()
+        return 0
 
     try:
         from PyQt6.QtCore import QTimer
