@@ -21,7 +21,6 @@ from .protocol import (CANCEL, ERROR, HELLO, HELLO_ACK, INPUT_DELTA,
 @dataclass
 class DeviceSnapshot:
     host_protocol: int = 2
-    safe_recovery: bool = True
     connected: bool = False
     port: str | None = None
     device: str | None = None
